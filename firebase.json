@@ -1,0 +1,26 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "campus-incident-app-157ba",
+          "appId": "1:801785882822:android:e57e2579f0821de8494fc7",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "campus-incident-app-157ba",
+          "configurations": {
+            "android": "1:801785882822:android:e57e2579f0821de8494fc7",
+            "ios": "1:801785882822:ios:a80e69df6fd1d9a2494fc7",
+            "web": "1:801785882822:web:415f3f7c4ef8ab89494fc7"
+          }
+        }
+      }
+    }
+  },
+  "firestore": {
+    "rules": "firestore.rules"
+  }
+}
