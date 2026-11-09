@@ -1,0 +1,200 @@
+rules_version = '2';
+
+// Campus Incident Reporting App: Firestore security rules.
+//
+// Summary
+//   users/{uid}      Each user reads their own profile. A user can create it once,
+//                    always as "student", and later change only their name.
+//                    The staff role is granted by an admin in the Console.
+//   incidents/{id}   Students create and read their own reports, and withdraw
+//                    them while still "submitted". Staff read every report and
+//                    change status, appending one history entry per change.
+//                    Nobody can edit a report's content after it is submitted.
+//                    Anonymous reports store "Anonymous student" instead of
+//                    the name, and staff cannot read users/ to look it up.
+//   incident_photos/{id}  One compressed photo per report (JPEG bytes, kept
+//                    here instead of Firebase Storage to stay on the free
+//                    plan). Created only together with its report, readable
+//                    by the reporter and staff, deleted only with the report.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    // Verified ALU email, matching AppConstants.allowedEmailDomains.
+    function isVerifiedAlu() {
+      return signedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email.lower().matches('.*@(alustudent|alueducation)[.]com');
+    }
+
+    function profilePath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+
+    function isStaff() {
+      return isVerifiedAlu()
+        && exists(profilePath())
+        && get(profilePath()).data.role == 'staff';
+    }
+
+    function incidentPath(id) {
+      return /databases/$(database)/documents/incidents/$(id);
+    }
+
+    function photoPath(id) {
+      return /databases/$(database)/documents/incident_photos/$(id);
+    }
+
+    function validStatus(s) {
+      return s in ['submitted', 'inProgress', 'resolved', 'rejected'];
+    }
+
+    function validCategory(c) {
+      return c in ['facilities', 'water', 'electricity', 'furniture', 'sanitation', 'safety', 'other'];
+    }
+
+    function optionalString(v, maxLen) {
+      return v == null || (v is string && v.size() <= maxLen);
+    }
+
+    // One statusHistory entry, written by the signed-in user.
+    function validHistoryEntry(e, status) {
+      return e.keys().hasOnly(['status', 'changedById', 'changedByName', 'note', 'at'])
+        && e.status == status
+        && e.changedById == request.auth.uid
+        && e.changedByName is string
+        && e.at is timestamp
+        && optionalString(e.note, 300);
+    }
+
+    // ---------- users ----------
+
+    match /users/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+
+      allow create: if isVerifiedAlu()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name', 'email', 'role', 'createdAt'])
+        && request.resource.data.role == 'student'   // nobody can make themselves staff
+        && request.resource.data.email == request.auth.token.email.lower()
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 60
+        && request.resource.data.createdAt == request.time;
+
+      // Only the name may change; role, email and createdAt are locked.
+      allow update: if isVerifiedAlu()
+        && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 60;
+
+      allow delete: if false;
+    }
+
+    // ---------- incidents ----------
+
+    match /incidents/{incidentId} {
+
+      // Students: only their own reports (the app's query filters on
+      // reporterId, which these rules can verify). Staff: all reports.
+      allow read: if isVerifiedAlu()
+        && (resource.data.reporterId == request.auth.uid || isStaff());
+
+      // New report: correct shape, always starts as "submitted", owned by the
+      // signed-in user, under their real profile name (or "Anonymous
+      // student"), server timestamps, and a photo document only if hasPhoto.
+      allow create: if isVerifiedAlu()
+        && exists(profilePath())
+        && request.resource.data.keys().hasOnly([
+             'title', 'description', 'category', 'location', 'locationDetail',
+             'status', 'hasPhoto', 'isAnonymous', 'reporterId', 'reporterName',
+             'createdAt', 'updatedAt', 'statusHistory'])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() >= 5
+        && request.resource.data.title.size() <= 80
+        && request.resource.data.description is string
+        && request.resource.data.description.size() >= 15
+        && request.resource.data.description.size() <= 1000
+        && validCategory(request.resource.data.category)
+        && request.resource.data.location is string
+        && request.resource.data.location.size() > 0
+        && request.resource.data.location.size() <= 60
+        && optionalString(request.resource.data.get('locationDetail', null), 60)
+        && request.resource.data.status == 'submitted'
+        && request.resource.data.hasPhoto is bool
+        && request.resource.data.hasPhoto == existsAfter(photoPath(incidentId))
+        && request.resource.data.isAnonymous is bool
+        && request.resource.data.reporterId == request.auth.uid
+        && ((request.resource.data.isAnonymous == false
+              && request.resource.data.reporterName == get(profilePath()).data.name)
+            || (request.resource.data.isAnonymous == true
+              && request.resource.data.reporterName == 'Anonymous student'))
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.statusHistory.size() == 1
+        && validHistoryEntry(request.resource.data.statusHistory[0], 'submitted')
+        && request.resource.data.statusHistory[0].changedByName
+             == request.resource.data.reporterName;   // no name leak when anonymous
+
+      // Staff status change: only status, updatedAt and statusHistory change;
+      // the old history is kept unchanged with exactly one new entry appended;
+      // rejecting requires a reason.
+      allow update: if isStaff()
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'updatedAt', 'statusHistory'])
+        && validStatus(request.resource.data.status)
+        && request.resource.data.status != resource.data.status
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.statusHistory.size() == resource.data.statusHistory.size() + 1
+        && request.resource.data.statusHistory[0:resource.data.statusHistory.size()]
+             == resource.data.statusHistory
+        && validHistoryEntry(
+             request.resource.data.statusHistory[resource.data.statusHistory.size()],
+             request.resource.data.status)
+        && (request.resource.data.status != 'rejected'
+            || (request.resource.data.statusHistory[resource.data.statusHistory.size()].note is string
+                && request.resource.data.statusHistory[resource.data.statusHistory.size()].note.size() > 0));
+
+      // Students may withdraw their own report until staff start on it.
+      // Staff never delete (reject instead), so the record is kept.
+      // The photo must be deleted in the same batch.
+      allow delete: if isVerifiedAlu()
+        && resource.data.reporterId == request.auth.uid
+        && resource.data.status == 'submitted'
+        && !existsAfter(photoPath(incidentId));
+    }
+
+    // ---------- incident photos ----------
+
+    match /incident_photos/{incidentId} {
+      allow read: if isVerifiedAlu()
+        && (resource.data.reporterId == request.auth.uid || isStaff());
+
+      // Only in the same batch that creates the report (never added later),
+      // only by its reporter, and small enough to fit in a document.
+      allow create: if isVerifiedAlu()
+        && request.resource.data.keys().hasOnly(['reporterId', 'data', 'createdAt'])
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.data is bytes
+        && request.resource.data.data.size() <= 700 * 1024
+        && request.resource.data.createdAt == request.time
+        && !exists(incidentPath(incidentId))
+        && getAfter(incidentPath(incidentId)).data.reporterId == request.auth.uid
+        && getAfter(incidentPath(incidentId)).data.hasPhoto == true;
+
+      allow update: if false;
+
+      // Only together with withdrawing the report.
+      allow delete: if isVerifiedAlu()
+        && resource.data.reporterId == request.auth.uid
+        && !existsAfter(incidentPath(incidentId));
+    }
+  }
+}
