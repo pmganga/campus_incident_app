@@ -55,9 +55,9 @@ void main() {
   });
 
   test('without a registered name, the email prefix is used', () async {
-    await auth.emit(FakeUser(email: 'p.mganga@alustudent.com'));
+    await auth.emit(FakeUser(email: 'test.student@alustudent.com'));
     await users.emit(null);
-    expect(users.created.single.name, 'p.mganga');
+    expect(users.created.single.name, 'test.student');
   });
 
   test('a role changed to staff in the Console applies immediately', () async {
